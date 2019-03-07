@@ -210,26 +210,26 @@ workflows:
       - compliance_scan:
           requires:
             - create_container_image
-      # - deploy_dev:
-      #     requires:
-      #       - compliance_scan
-      #       - compile_and_test
-      #       - precommit_checks
-      #       - vulnerability_scan
-      #     filters:
-      #       branches:
-      #         only: master
-      # - prod_approval:
-      #     type: approval
-      #     requires:
-      #       - deploy_dev
-      # - imp_approval:
-      #     type: approval
-      #     requires:
-      #       - deploy_dev
-      # - deploy_prod:
-      #     requires:
-      #       - prod_approval
-      # - deploy_imp:
-      #     requires:
-      #       - imp_approval
+      - deploy_dev:
+          requires:
+            - compliance_scan
+            - compile_and_test
+            - precommit_checks
+            - vulnerability_scan
+          filters:
+            branches:
+              only: master
+      - prod_approval:
+          type: approval
+          requires:
+            - deploy_dev
+      - imp_approval:
+          type: approval
+          requires:
+            - deploy_dev
+      - deploy_prod:
+          requires:
+            - prod_approval
+      - deploy_imp:
+          requires:
+            - imp_approval
