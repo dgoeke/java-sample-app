@@ -1,0 +1,235 @@
+version: 2
+
+jobs:
+  compile_and_test:
+    docker:
+      - image: gradle:jdk10
+    working_directory: /home/gradle/app
+    steps:
+      - checkout
+      - run:
+          name: Building
+          command: gradle build
+      - run:
+          name: Running tests
+          command: gradle test
+
+  precommit_checks:
+    docker:
+      - image: 027086599304.dkr.ecr.us-west-2.amazonaws.com/testapp-pipeline-tools:latest
+    working_directory: /app
+    steps:
+      - checkout
+      - run:
+          name: Pre-commit checks
+          command: pre-commit run --all-files
+
+  create_container_image:
+    docker:
+      - image: docker:18.09-git
+    environment:
+      DOCKER_IMAGE: testapp-java
+    working_directory: /app
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Building application Docker image
+          command: docker build -t $DOCKER_IMAGE .
+      - run:
+          name: Save image to an archive
+          command: |
+            mkdir docker-image
+            docker save -o docker-image/image.tar $DOCKER_IMAGE
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker-image
+
+  vulnerability_scan:
+    docker:
+      - image: docker:18.09-git
+    environment:
+      DOCKER_IMAGE: testapp-java
+    working_directory: /app
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Load image
+          command: |
+            docker load --input workspace/docker-image/image.tar
+      - run:
+          # TODO: remove "|| true" below to report real results from vulnerability scans
+          name: Scanning application Docker image
+          command: |
+            docker network create scanning
+            docker run -p 5432:5432 -d --net=scanning --name db arminc/clair-db:latest
+            docker run -p 6060:6060  --net=scanning --link db:postgres -d --name clair arminc/clair-local-scan:v2.0.6
+            docker run --net=scanning --rm --name=scanner --link=clair:clair -v '/var/run/docker.sock:/var/run/docker.sock'  objectiflibre/clair-scanner --clair="http://clair:6060" --ip="scanner" -t Medium $DOCKER_IMAGE || true
+
+  compliance_scan:
+    docker:
+      - image: docker:18.09-git
+    environment:
+      DOCKER_IMAGE: testapp-java
+    working_directory: /app
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Load image
+          command: |
+            docker load --input workspace/docker-image/image.tar
+      - run:
+          name: Build scanner image with custom InSpec profiles
+          command: docker build -t my-inspec ./inspec
+      - run:
+          name: Scanning application Docker image
+          command: |
+            docker run --detach --name app -it $DOCKER_IMAGE /bin/sh
+            docker run --name=scanner -v '/var/run/docker.sock:/var/run/docker.sock' my-inspec exec profiles/sample -t docker://app
+
+  deploy_dev:
+    docker:
+      - image: circleci/python:3.6.1
+    environment:
+      DOCKER_IMAGE: testapp-java
+      AWS_DEFAULT_OUTPUT: json
+      DOCKER_IMAGE_VERSION: 1.0.0
+    working_directory: /home/circleci/app
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Install AWS CLI
+          command: |
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install awscli
+      - run:
+          name: Installing terraform
+          environment:
+            TERRAFORM_VERSION: 0.11.11
+          working_directory: /tmp
+          command: |
+            curl -LO https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+            unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+      - run:
+          name: Load image
+          command: |
+            docker load --input workspace/docker-image/image.tar
+      - run:
+          name: Push image to ECR
+          command: |
+            export IMAGE_VERSION=${DOCKER_IMAGE_VERSION}-$(git rev-parse --short HEAD)
+            export FULL_IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPOSITORY_NAME}:${IMAGE_VERSION}"
+            echo "export IMAGE_VERSION=${IMAGE_VERSION}" >> $BASH_ENV
+            . venv/bin/activate
+            eval $(aws ecr get-login --region $AWS_DEFAULT_REGION --no-include-email)
+            docker tag $DOCKER_IMAGE "${FULL_IMAGE_NAME}"
+            docker push "${FULL_IMAGE_NAME}"
+      - run:
+          name: Deploy new image
+          working_directory: /home/circleci/app/terraform/envs/dev
+          command: |
+            /tmp/terraform init
+            /tmp/terraform plan -var "tag=${IMAGE_VERSION}" -out=plan.out
+            /tmp/terraform apply plan.out
+
+  deploy_prod:
+    docker:
+      - image: circleci/python:3.6.1
+    environment:
+      DOCKER_IMAGE: testapp-java
+      AWS_DEFAULT_OUTPUT: json
+      DOCKER_IMAGE_VERSION: 1.0.0
+    working_directory: /home/circleci/app
+    steps:
+      - checkout
+      - setup_remote_docker
+      - attach_workspace:
+          at: workspace
+      - run:
+          name: Install AWS CLI
+          command: |
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install awscli
+      - run:
+          name: Installing terraform
+          environment:
+            TERRAFORM_VERSION: 0.11.11
+          working_directory: /tmp
+          command: |
+            curl -LO https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+            unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+      - run:
+          name: Load image
+          command: |
+            docker load --input workspace/docker-image/image.tar
+      - run:
+          name: Deploy new image
+          working_directory: /home/circleci/app/terraform/envs/prod
+          command: |
+            export IMAGE_VERSION=${DOCKER_IMAGE_VERSION}-$(git rev-parse --short HEAD)
+            /tmp/terraform init
+            /tmp/terraform plan -var "tag=${IMAGE_VERSION}" -out=plan.out
+            /tmp/terraform apply plan.out
+
+  deploy_imp:
+    docker:
+      - image: circleci/python:3.6.1
+    environment:
+      DOCKER_IMAGE: testapp-java
+      AWS_DEFAULT_OUTPUT: json
+      DOCKER_IMAGE_VERSION: 1.0.0
+    working_directory: /home/circleci/app
+    steps:
+      - checkout
+      - run:
+          name: Not yet enabled
+          command: echo "'imp' environment is not yet configured"
+
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - compile_and_test
+      - precommit_checks
+      - create_container_image
+      - vulnerability_scan:
+          requires:
+            - create_container_image
+      - compliance_scan:
+          requires:
+            - create_container_image
+      # - deploy_dev:
+      #     requires:
+      #       - compliance_scan
+      #       - compile_and_test
+      #       - precommit_checks
+      #       - vulnerability_scan
+      #     filters:
+      #       branches:
+      #         only: master
+      # - prod_approval:
+      #     type: approval
+      #     requires:
+      #       - deploy_dev
+      # - imp_approval:
+      #     type: approval
+      #     requires:
+      #       - deploy_dev
+      # - deploy_prod:
+      #     requires:
+      #       - prod_approval
+      # - deploy_imp:
+      #     requires:
+      #       - imp_approval
